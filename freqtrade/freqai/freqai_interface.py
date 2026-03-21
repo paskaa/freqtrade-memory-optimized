@@ -616,6 +616,24 @@ class IFreqaiModel(ABC):
                                     (larger than new_trained_timerange so that
                                     new_trained_timerange does not contain any NaNs)
         """
+        # Memory cleanup before starting new training
+        logger.info(f"Preparing memory for training {pair}...")
+        gc.collect()
+        try:
+            ctypes_lib = CDLL(None)
+            ctypes_lib.malloc_trim(c_int(0))
+        except Exception:
+            pass
+
+        # Check available memory
+        mem = psutil.virtual_memory()
+        logger.info(f"Available memory before training {pair}: {mem.available / (1024**3):.2f}GB ({mem.percent}% used)")
+
+        # Warn if memory is low
+        if mem.percent > 85:
+            logger.warning(f"Low memory warning: {mem.percent}% used. Waiting for GC...")
+            gc.collect()
+            time.sleep(2)
 
         corr_dataframes, base_dataframes = self.dd.get_base_and_corr_dataframes(
             data_load_timerange, pair, dk
@@ -631,9 +649,17 @@ class IFreqaiModel(ABC):
 
         unfiltered_dataframe = dk.slice_dataframe(buffered_timerange, unfiltered_dataframe)
 
+        # Memory cleanup after data preparation
+        logger.info(f"Memory cleanup after data preparation for {pair}...")
+        gc.collect()
+
         # find the features indicated by strategy and store in datakitchen
         dk.find_features(unfiltered_dataframe)
         dk.find_labels(unfiltered_dataframe)
+
+        # Check memory before training
+        mem = psutil.virtual_memory()
+        logger.info(f"Memory before model training {pair}: {mem.available / (1024**3):.2f}GB available")
 
         self.tb_logger = get_tb_logger(self.dd.model_type, dk.data_path, self.activate_tensorboard)
         model = self.train(unfiltered_dataframe, pair, dk)
@@ -650,19 +676,40 @@ class IFreqaiModel(ABC):
 
         # Memory cleanup after training each model to prevent memory fragmentation
         logger.info(f"Cleaning up memory after training {pair}...")
+
+        # Delete large objects
         del model
         del unfiltered_dataframe
         del corr_dataframes
         del base_dataframes
+
+        # Clear datakitchen data
+        if hasattr(dk, 'data') and dk.data:
+            dk.data.clear()
+        if hasattr(dk, 'historic_data'):
+            dk.historic_data = {}
+
+        # Multiple GC passes for thorough cleanup
         gc.collect()
+        gc.collect()  # Second pass for circular references
+        gc.collect()  # Third pass for final cleanup
 
         # Release memory back to OS using malloc_trim (Linux only)
         try:
-            ctypes = CDLL(None)
-            ctypes.malloc_trim(c_int(0))
-            logger.info(f"Memory cleanup completed for {pair}")
+            ctypes_lib = CDLL(None)
+            ctypes_lib.malloc_trim(c_int(0))
         except Exception:
-            pass  # malloc_trim not available on non-Linux systems
+            pass
+
+        # Check memory after cleanup
+        mem = psutil.virtual_memory()
+        logger.info(f"Memory cleanup completed for {pair}: {mem.available / (1024**3):.2f}GB available ({mem.percent}% used)")
+
+        # If memory is still high, wait a bit
+        if mem.percent > 80:
+            logger.warning(f"High memory usage after cleanup: {mem.percent}%. Waiting...")
+            time.sleep(3)
+            gc.collect()
 
     def set_initial_historic_predictions(
         self, pred_df: DataFrame, dk: FreqaiDataKitchen, pair: str, strat_df: DataFrame
