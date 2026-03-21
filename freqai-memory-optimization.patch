@@ -1,0 +1,206 @@
+From ff310fc98505bca8e557656ea59c0dcbe2f284ac Mon Sep 17 00:00:00 2001
+From: paskaa <paskaa@users.noreply.github.com>
+Date: Sat, 21 Mar 2026 20:19:57 +0800
+Subject: [PATCH] FreqAI Memory Optimization and Training Improvements
+
+## Changes
+
+### 1. FreqAI Memory Management (freqai_interface.py)
+- Added automatic memory cleanup after each model training
+- Implemented gc.collect() and malloc_trim() to prevent memory fragmentation
+- Added debug logging for training progress monitoring
+- Prevents "malloc(): corrupted top size" crashes during long training sessions
+
+### 2. Exchange Proxy Compatibility (exchange.py)
+- Fixed async API calls to use sync API for proxy compatibility
+- Improved market loading with better error handling
+- Added logging for leverage tiers loading progress
+
+### 3. Type Safety Fix (trade_model.py)
+- Fixed stop_loss_pct type conversion to ensure float type
+
+## Benefits
+- Stable training for large number of coins
+- Memory usage stays stable during continuous model training
+- Better visibility into training progress via logs
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ freqtrade/exchange/exchange.py       | 43 ++++++++++++++++++++++------
+ freqtrade/freqai/freqai_interface.py | 21 ++++++++++++++
+ freqtrade/persistence/trade_model.py |  4 +--
+ 3 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/freqtrade/exchange/exchange.py b/freqtrade/exchange/exchange.py
+index 83fe564..e12de45 100644
+--- a/freqtrade/exchange/exchange.py
++++ b/freqtrade/exchange/exchange.py
+@@ -278,6 +278,9 @@ class Exchange:
+         ccxt_async_config = deep_merge_dicts(
+             exchange_conf.get("ccxt_async_config", {}), ccxt_async_config
+         )
++        # Fix for proxy compatibility: remove httpsProxy from async config if aiohttp_proxy exists
++        if 'aiohttp_proxy' in ccxt_async_config and 'httpsProxy' in ccxt_async_config:
++            del ccxt_async_config['httpsProxy']
+         self._api_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
+         _has_watch_ohlcv = self.exchange_has("watchOHLCV") and self._ft_has["ws_enabled"]
+         if (
+@@ -301,7 +304,9 @@ class Exchange:
+             self.validate_config(self._config)
+ 
+         if self.trading_mode != TradingMode.SPOT and load_leverage_tiers:
++            logger.info("Loading leverage tiers...")
+             self.fill_leverage_tiers()
++            logger.info("Leverage tiers loaded.")
+         self.ft_additional_exchange_init()
+ 
+     def __del__(self):
+@@ -676,8 +681,13 @@ class Exchange:
+             self._exchange_ws.reset_connections()
+ 
+     async def _api_reload_markets(self, reload: bool = False) -> None:
++        # Use sync API for proxy compatibility
+         try:
+-            await self._api_async.load_markets(reload=reload, params={})
++            self._api.load_markets(reload=reload)
++            # Copy to async API
++            self._api_async.markets = self._api.markets
++            self._api_async.markets_by_id = self._api.markets_by_id
++            self._api_async.currencies = self._api.currencies
+         except ccxt.DDoSProtection as e:
+             raise DDosProtection(e) from e
+         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+@@ -688,13 +698,27 @@ class Exchange:
+             raise TemporaryError(e) from e
+ 
+     def _load_async_markets(self, reload: bool = False) -> None:
++        # Use sync API directly for proxy compatibility
++        logger.info("Loading markets via sync API with proxy...")
+         try:
+-            with self._loop_lock:
+-                markets = self.loop.run_until_complete(self._api_reload_markets(reload=reload))
+-
+-            if isinstance(markets, Exception):
+-                raise markets
+-            return None
++            self._api.load_markets(reload=reload)
++            logger.info(f"Loaded {len(self._api.markets)} markets via sync API")
++            # Copy to async API
++            self._api_async.markets = self._api.markets
++            self._api_async.markets_by_id = self._api.markets_by_id
++            self._api_async.currencies = self._api.currencies
++            logger.info("Markets copied to async API")
++        except ccxt.DDoSProtection as e:
++            logger.warning("Could not load markets. Reason: %s", e)
++            raise DDosProtection(e) from e
++        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
++            logger.warning("Could not load markets. Reason: %s", e)
++            raise TemporaryError(
++                f"Error in reload_markets due to {e.__class__.__name__}. Message: {e}"
++            ) from e
++        except ccxt.BaseError as e:
++            logger.warning("Could not load markets. Reason: %s", e)
++            raise TemporaryError(e) from e
+         except TimeoutError as e:
+             logger.warning("Could not load markets. Reason: %s", e)
+             raise TemporaryError from e
+@@ -3508,8 +3532,11 @@ class Exchange:
+ 
+     @retrier
+     def get_leverage_tiers(self) -> dict[str, list[dict]]:
++        logger.info("Fetching leverage tiers via sync API...")
+         try:
+-            return self._api.fetch_leverage_tiers()
++            tiers = self._api.fetch_leverage_tiers()
++            logger.info(f"Fetched leverage tiers for {len(tiers)} symbols")
++            return tiers
+         except ccxt.DDoSProtection as e:
+             raise DDosProtection(e) from e
+         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+diff --git a/freqtrade/freqai/freqai_interface.py b/freqtrade/freqai/freqai_interface.py
+index 1ba58d3..7725149 100644
+--- a/freqtrade/freqai/freqai_interface.py
++++ b/freqtrade/freqai/freqai_interface.py
+@@ -1,8 +1,10 @@
++import gc
+ import logging
+ import threading
+ import time
+ from abc import ABC, abstractmethod
+ from collections import deque
++from ctypes import CDLL, c_int
+ from datetime import UTC, datetime
+ from pathlib import Path
+ from typing import Any, Literal
+@@ -225,6 +227,7 @@ class IFreqaiModel(ABC):
+         it simply trains on what ever data is available in the self.dd.
+         :param strategy: IStrategy = The user defined strategy class
+         """
++        logger.info("FreqAI scanning thread started")
+         while not self._stop_event.is_set():
+             time.sleep(1)
+ 
+@@ -232,6 +235,7 @@ class IFreqaiModel(ABC):
+                 continue
+ 
+             pair = self.train_queue[0]
++            logger.info(f"Checking pair {pair} for training")
+ 
+             # ensure pair is available in dp
+             if pair not in strategy.dp.current_whitelist():
+@@ -248,6 +252,7 @@ class IFreqaiModel(ABC):
+                 data_load_timerange,
+             ) = dk.check_if_new_training_required(trained_timestamp)
+ 
++            logger.info(f"Pair {pair}: retrain={retrain}, trained_timestamp={trained_timestamp}")
+             if retrain:
+                 self.train_timer("start")
+                 dk.set_paths(pair, new_trained_timerange.stopts)
+@@ -643,6 +648,22 @@ class IFreqaiModel(ABC):
+ 
+         self.dd.purge_old_models()
+ 
++        # Memory cleanup after training each model to prevent memory fragmentation
++        logger.info(f"Cleaning up memory after training {pair}...")
++        del model
++        del unfiltered_dataframe
++        del corr_dataframes
++        del base_dataframes
++        gc.collect()
++
++        # Release memory back to OS using malloc_trim (Linux only)
++        try:
++            ctypes = CDLL(None)
++            ctypes.malloc_trim(c_int(0))
++            logger.info(f"Memory cleanup completed for {pair}")
++        except Exception:
++            pass  # malloc_trim not available on non-Linux systems
++
+     def set_initial_historic_predictions(
+         self, pred_df: DataFrame, dk: FreqaiDataKitchen, pair: str, strat_df: DataFrame
+     ) -> None:
+diff --git a/freqtrade/persistence/trade_model.py b/freqtrade/persistence/trade_model.py
+index e6107ea..4f1acef 100644
+--- a/freqtrade/persistence/trade_model.py
++++ b/freqtrade/persistence/trade_model.py
+@@ -809,7 +809,7 @@ class LocalTrade:
+             self.initial_stop_loss = stop_loss
+         self.stop_loss = stop_loss
+ 
+-        self.stop_loss_pct = -1 * abs(percent)
++        self.stop_loss_pct = float(-1 * abs(percent))
+ 
+     def adjust_stop_loss(
+         self,
+@@ -851,7 +851,7 @@ class LocalTrade:
+                 self.precision_mode_price,
+                 rounding_mode=ROUND_DOWN if self.is_short else ROUND_UP,
+             )
+-            self.initial_stop_loss_pct = -1 * abs(stoploss)
++            self.initial_stop_loss_pct = float(-1 * abs(stoploss))
+ 
+         # evaluate if the stop loss needs to be updated
+         else:
+-- 
+2.43.0
+
