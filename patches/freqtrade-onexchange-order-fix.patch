@@ -1,0 +1,131 @@
+From d67915b973f2af494674c8d9e75cbb87d4cb1ca4 Mon Sep 17 00:00:00 2001
+From: paskaa <paskaa@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 15:27:32 +0800
+Subject: [PATCH] fix: don't re-add an existing order in
+ handle_onexchange_order
+
+handle_onexchange_order() only skipped orders belonging to a *different*
+trade. An order that is already stored for the current trade, but missing
+from the in-memory trade.orders collection (stale session state), fell
+through to the insert path - the INSERT then failed with an IntegrityError
+on the (ft_pair, order_id) unique constraint, which also rolled back the
+whole recovery run:
+
+    duplicate key value violates unique constraint "_order_pair_order_id"
+    Key (ft_pair, order_id)=(ENA/USDT:USDT, 3dbc8f50-...) already exists
+
+Reuse the stored order in that case (and attach it to the trade), so the
+update_trade_state() call further down can find it as well.
+---
+ freqtrade/freqtradebot.py               | 42 ++++++++++++++++---------
+ tests/freqtradebot/test_freqtradebot.py | 38 ++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 14 deletions(-)
+
+diff --git a/freqtrade/freqtradebot.py b/freqtrade/freqtradebot.py
+index 050d77ab5..578da16dd 100644
+--- a/freqtrade/freqtradebot.py
++++ b/freqtrade/freqtradebot.py
+@@ -701,23 +701,37 @@ class FreqtradeBot(LoggingMixin):
+                     order_obj = trade_order[0]
+                 else:
+                     existing_order = Order.order_by_id(order["id"], trade.pair)
+-                    if existing_order is not None and existing_order.ft_trade_id != trade.id:
+-                        # Order belongs to a different trade
++                    if existing_order is not None:
++                        if existing_order.ft_trade_id != trade.id:
++                            # Order belongs to a different trade
++                            logger.info(
++                                f"Order {order['id']} for {trade.pair} already belongs to "
++                                f"trade {existing_order.ft_trade_id} - skipping."
++                            )
++                            continue
++                        # Order is already stored for this trade, but not part of the
++                        # in-memory collection (can happen with a stale session).
++                        # Re-using it avoids inserting a duplicate, which would violate
++                        # the (pair, order_id) unique constraint.
+                         logger.info(
+-                            f"Order {order['id']} for {trade.pair} already belongs to "
+-                            f"trade {existing_order.ft_trade_id} - skipping."
++                            f"Order {order['id']} for {trade.pair} is already stored for "
++                            f"trade {trade.id} - reusing it."
++                        )
++                        order_obj = existing_order
++                        if existing_order not in trade.orders:
++                            trade.orders.append(existing_order)
++                    else:
++                        logger.info(
++                            f"Found previously unknown order {order['id']} for {trade.pair}."
+                         )
+-                        continue
+-
+-                    logger.info(f"Found previously unknown order {order['id']} for {trade.pair}.")
+ 
+-                    order_obj = Order.parse_from_ccxt_object(order, trade.pair, order["side"])
+-                    order_obj.order_filled_date = dt_from_ts(
+-                        safe_value_fallback(order, "lastTradeTimestamp", "timestamp")
+-                    )
+-                    trade.orders.append(order_obj)
+-                    Trade.commit()
+-                    trade.exit_reason = ExitType.SOLD_ON_EXCHANGE.value
++                        order_obj = Order.parse_from_ccxt_object(order, trade.pair, order["side"])
++                        order_obj.order_filled_date = dt_from_ts(
++                            safe_value_fallback(order, "lastTradeTimestamp", "timestamp")
++                        )
++                        trade.orders.append(order_obj)
++                        Trade.commit()
++                        trade.exit_reason = ExitType.SOLD_ON_EXCHANGE.value
+ 
+                 self.update_trade_state(trade, order["id"], order, send_msg=False)
+ 
+diff --git a/tests/freqtradebot/test_freqtradebot.py b/tests/freqtradebot/test_freqtradebot.py
+index 464a776d2..f2727d7ad 100644
+--- a/tests/freqtradebot/test_freqtradebot.py
++++ b/tests/freqtradebot/test_freqtradebot.py
+@@ -5273,6 +5273,44 @@ def test_handle_onexchange_order_other_trade(mocker, default_conf_usdt, fee, cap
+     assert trade.is_open is True
+ 
+ 
++@pytest.mark.usefixtures("init_persistence")
++def test_handle_onexchange_order_known_order_same_trade(
++    mocker, default_conf_usdt, fee, caplog
++):
++    # An order that is already stored for this trade, but missing from the in-memory
++    # collection (stale session), must be reused instead of being inserted again -
++    # inserting it would violate the (ft_pair, order_id) unique constraint.
++    default_conf_usdt["dry_run"] = False
++    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
++    create_mock_trades_usdt(fee)
++
++    trade = Trade.get_trades([Trade.id == 1]).first()
++    prev_order_count = len(trade.orders)
++
++    ccxt_order = trade.orders[-1].to_ccxt_object()
++    ccxt_order.update({"id": "stale_order_1"})
++    stale_order = Order.parse_from_ccxt_object(ccxt_order, trade.pair, ccxt_order["side"])
++    stale_order.ft_trade_id = trade.id
++    Order.session.add(stale_order)
++    # Flush (not commit) - so the already loaded trade keeps its stale order collection.
++    Trade.session.flush()
++    assert "stale_order_1" not in [o.order_id for o in trade.orders]
++
++    mocker.patch(f"{EXMS}.fetch_orders", return_value=[ccxt_order])
++    freqtrade.wallets = MagicMock()
++    freqtrade.wallets.get_owned = MagicMock(return_value=trade.amount)
++
++    assert freqtrade.handle_onexchange_order(trade) is False
++    assert log_has_re(r"Order stale_order_1 .* is already stored for trade 1 - reusing it\.", caplog)
++    assert not log_has_re(r"Error finding onexchange order", caplog)
++
++    # The existing order was reused - no duplicate row was added.
++    trade = Trade.get_trades([Trade.id == 1]).first()
++    assert [o.order_id for o in trade.orders].count("stale_order_1") == 1
++    assert len(trade.orders) == prev_order_count + 1
++    assert Order.order_by_id("stale_order_1", trade.pair) is not None
++
++
+ @pytest.mark.usefixtures("init_persistence")
+ def test_handle_onexchange_order_rollback(mocker, default_conf_usdt, fee, caplog):
+     # Assigning an order that's already owned by another trade on the same pair violates the
+-- 
+2.43.0
+
