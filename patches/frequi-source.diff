@@ -1,8 +1,8 @@
 diff --git a/src/stores/ftbot.ts b/src/stores/ftbot.ts
-index 16a7a4e2..41658417 100644
+index 16a7a4e2..57f050b2 100644
 --- a/src/stores/ftbot.ts
 +++ b/src/stores/ftbot.ts
-@@ -266,28 +266,38 @@ export function createBotSubStore(botId: string, botName: string) {
+@@ -266,28 +266,55 @@ export function createBotSubStore(botId: string, botName: string) {
        },
        async getTrades() {
          try {
@@ -19,6 +19,23 @@ index 16a7a4e2..41658417 100644
 +              params: { limit, offset, order_by_id: false },
              });
            };
++
++          // Cheap check if the trades we already have are still up to date. Trade-ids are
++          // unique on the backend, so the newest trade-id identifies the history.
++          const probe = await fetchTrades(1, 0);
++          const expectedTrades =
++            maxTradesLoaded === 0
++              ? probe.data.total_trades
++              : Math.min(probe.data.total_trades, maxTradesLoaded);
++          if (
++            expectedTrades > 0 &&
++            this.trades.length === expectedTrades &&
++            this.trades[0]?.trade_id === probe.data.trades[0]?.trade_id
++          ) {
++            // Nothing changed - avoid re-downloading the entire trade history.
++            return Promise.resolve();
++          }
++
            const res = await fetchTrades(pageLength, 0);
            const result: TradeResponse = res.data;
            let { trades } = result;
@@ -91,15 +108,19 @@ index d99d8197..21c6095e 100644
        console.log('Stopping automatic refresh.');
        if (this.refreshInterval) {
 diff --git a/src/stores/settings.ts b/src/stores/settings.ts
-index 1d3558c5..144a51f9 100644
+index 1d3558c5..efe91f39 100644
 --- a/src/stores/settings.ts
 +++ b/src/stores/settings.ts
-@@ -38,6 +38,12 @@ export const useSettingsStore = defineStore('uiSettings', {
+@@ -38,6 +38,16 @@ export const useSettingsStore = defineStore('uiSettings', {
        multiPaneButtonsShowText: false,
        multiPairSelection: false,
        backtestAdditionalMetrics: ['profit_factor', 'expectancy'] as string[],
-+      /** Maximum number of historic trades to load. 0 means no limit. */
-+      maxTradesLoaded: 500,
++      /**
++       * Maximum number of historic trades to load. 0 means no limit.
++       * Limiting this speeds up the UI, but older trades (and charts derived from them,
++       * such as the cumulative profit chart) will only cover the loaded trades.
++       */
++      maxTradesLoaded: 0,
 +      /** Interval for the frequent refresh (open trades) in ms. */
 +      frequentRefreshInterval: 5000,
 +      /** Interval for the slow refresh (trade history, balance, ...) in ms. */
@@ -108,7 +129,7 @@ index 1d3558c5..144a51f9 100644
    },
    getters: {
 diff --git a/src/views/SettingsView.vue b/src/views/SettingsView.vue
-index c5a53914..014fc63b 100644
+index c5a53914..091f186f 100644
 --- a/src/views/SettingsView.vue
 +++ b/src/views/SettingsView.vue
 @@ -4,6 +4,7 @@ import { FtWsMessageTypes } from '@/types/wsMessageTypes';
@@ -119,21 +140,20 @@ index c5a53914..014fc63b 100644
  
  const timezoneOptions = ['UTC', Intl.DateTimeFormat().resolvedOptions().timeZone];
  const openTradesOptions = [
-@@ -11,6 +12,13 @@ const openTradesOptions = [
+@@ -11,6 +12,12 @@ const openTradesOptions = [
    { value: OpenTradeVizOptions.asTitle, text: 'Show in title' },
    { value: OpenTradeVizOptions.noOpenTrades, text: "Don't show open trades in header" },
  ];
 +const maxTradesOptions = [
-+  { value: 500, text: '500 trades' },
++  { value: 0, text: 'Unlimited (load all trades)' },
 +  { value: 1000, text: '1000 trades' },
 +  { value: 2000, text: '2000 trades' },
 +  { value: 5000, text: '5000 trades' },
-+  { value: 0, text: 'Unlimited' },
 +];
  const colorPreferenceOptions = [
    { value: ColorPreferences.GREEN_UP, text: 'Green Up/Red Down' },
    { value: ColorPreferences.RED_UP, text: 'Green Down/Red Up' },
-@@ -21,6 +29,12 @@ const resetDynamicLayout = () => {
+@@ -21,6 +28,12 @@ const resetDynamicLayout = () => {
    layoutStore.resetDashboardLayout();
    showAlert('Layouts have been reset.');
  };
@@ -146,7 +166,7 @@ index c5a53914..014fc63b 100644
  </script>
  
  <template>
-@@ -136,6 +150,49 @@ const resetDynamicLayout = () => {
+@@ -136,6 +149,50 @@ const resetDynamicLayout = () => {
              >
            </BaseCheckbox>
  
@@ -161,8 +181,9 @@ index c5a53914..014fc63b 100644
 +            />
 +            <small class="text-surface-600 dark:text-surface-400">
 +              Trade history can easily be several MB for long running bots. Limiting the number of
-+              trades loaded will speed up the UI, but older trades won't be available in the trade
-+              list.
++              trades loaded speeds up the UI, but older trades won't be available in the trade list
++              - and views derived from it (closed trades, cumulative profit) will only cover the
++              loaded trades.
 +            </small>
 +          </div>
 +

@@ -1,17 +1,20 @@
-From 342c79d73c7b5c7c15c334acb329340a52c46e83 Mon Sep 17 00:00:00 2001
+From 0d2cd4599ca65c0bcdfc87a619a04f51d670dbea Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?=E5=8D=8E=E4=BD=97?= <huatuo@gentronhealth.com>
 Date: Tue, 15 Sep 2026 15:00:57 +0800
-Subject: [PATCH] feat: make trade history limit and refresh intervals
- configurable
+Subject: [PATCH] feat: avoid re-downloading unchanged trade history, make
+ refresh intervals configurable
 
-Loading the whole trade history is expensive for long running bots -
-the dashboard refetches it whenever the open trade set changes, which
-can easily be several MB per refresh.
+The dashboard refetches the complete trade history whenever the open trade
+set changes, and getTrades() pages through all trades in 500-trade chunks -
+several MB for long running bots.
 
-* New setting to limit the number of trades loaded (default 500,
-  "Unlimited" restores the previous behaviour). Trades are now
-  requested newest-first, so a limited load returns the most recent
-  trades instead of the oldest ones.
+* Only re-download the trade history when it actually changed: a cheap
+  limit=1 request is used to compare the total trade count and the newest
+  trade id against what is already loaded.
+* Trades are requested newest-first (order_by_id=false). Without this,
+  limit/offset paging only ever returns the oldest trades.
+* Optional "Maximum number of trades to load" setting (default: unlimited)
+  for users who prefer the speedup over having the full history.
 * New settings for the frequent (open trades) and slow (trade history)
   refresh intervals, defaulting to the previous hardcoded 5s / 60s.
 ---
