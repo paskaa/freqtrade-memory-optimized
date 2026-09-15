@@ -1,0 +1,158 @@
+From e580c91b64c152905fea0a487ef041ca623c542c Mon Sep 17 00:00:00 2001
+From: paskaa <paskaa@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 14:47:17 +0800
+Subject: [PATCH] feat: compress API responses using gzip
+
+Trade history responses can easily reach several MB, which makes
+loading them slow - especially over a network connection.
+
+Add Starlette's GZipMiddleware to compress responses larger than 1KB
+(1.4MB of trade history compresses down to ~185KB).
+This can be disabled with "enable_gzip": false in the api_server
+configuration.
+---
+ config_examples/config_full.example.json |  1 +
+ docs/rest-api.md                         |  7 ++++
+ freqtrade/config_schema/config_schema.py |  4 +++
+ freqtrade/rpc/api_server/webserver.py    |  9 +++++
+ tests/rpc/test_rpc_apiserver.py          | 45 ++++++++++++++++++++++++
+ 5 files changed, 66 insertions(+)
+
+diff --git a/config_examples/config_full.example.json b/config_examples/config_full.example.json
+index 56086aabc..42c7a3730 100644
+--- a/config_examples/config_full.example.json
++++ b/config_examples/config_full.example.json
+@@ -180,6 +180,7 @@
+         "listen_port": 8080,
+         "verbosity": "error",
+         "enable_openapi": false,
++        "enable_gzip": true,
+         "jwt_secret_key": "somethingRandomSomethingRandom123",
+         "CORS_origins": [],
+         "username": "freqtrader",
+diff --git a/docs/rest-api.md b/docs/rest-api.md
+index 032f2182f..c7a806bb1 100644
+--- a/docs/rest-api.md
++++ b/docs/rest-api.md
+@@ -17,6 +17,7 @@ Sample configuration:
+         "listen_port": 8080,
+         "verbosity": "error",
+         "enable_openapi": false,
++        "enable_gzip": true,
+         "jwt_secret_key": "somethingRandomSomethingRandom123",
+         "CORS_origins": [],
+         "username": "Freqtrader",
+@@ -327,6 +328,12 @@ To properly configure your reverse proxy (securely), please consult it's documen
+ To enable the builtin openAPI interface (Swagger UI), specify `"enable_openapi": true` in the api_server configuration.
+ This will enable the Swagger UI at the `/docs` endpoint. By default, that's running at <http://localhost:8080/docs> - but it'll depend on your settings.
+ 
++### Response compression
++
++By default, API responses larger than 1KB are compressed using gzip.
++Both the UI and API clients will transparently decompress these responses, which can considerably reduce the transfer size for data-heavy endpoints (e.g. trade history, which can easily be multiple megabytes).
++This can be disabled by setting `"enable_gzip": false` in the api_server configuration.
++
+ ### Advanced API usage using JWT tokens
+ 
+ !!! Note
+diff --git a/freqtrade/config_schema/config_schema.py b/freqtrade/config_schema/config_schema.py
+index c7c3fe09f..aecb315f0 100644
+--- a/freqtrade/config_schema/config_schema.py
++++ b/freqtrade/config_schema/config_schema.py
+@@ -809,6 +809,10 @@ CONF_SCHEMA = {
+                     "type": "string",
+                     "enum": ["error", "info"],
+                 },
++                "enable_gzip": {
++                    "description": "Compress API responses larger than 1KB using gzip.",
++                    "type": "boolean",
++                },
+             },
+             "required": [
+                 "enabled",
+diff --git a/freqtrade/rpc/api_server/webserver.py b/freqtrade/rpc/api_server/webserver.py
+index b2888d9bc..d439e7df2 100644
+--- a/freqtrade/rpc/api_server/webserver.py
++++ b/freqtrade/rpc/api_server/webserver.py
+@@ -7,6 +7,7 @@ import orjson
+ import uvicorn
+ from fastapi import Depends, FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
++from starlette.middleware.gzip import GZipMiddleware
+ from starlette.responses import JSONResponse
+ 
+ from freqtrade.configuration import running_in_docker
+@@ -288,6 +289,14 @@ class ApiServer(RPCHandler):
+             allow_headers=["*"],
+         )
+ 
++        if config["api_server"].get("enable_gzip", True):
++            # Compress responses above 1k (Trade history can easily be multiple MB).
++            app.add_middleware(
++                GZipMiddleware,
++                minimum_size=1024,
++                compresslevel=6,
++            )
++
+         app.add_exception_handler(RPCException, self.handle_rpc_exception)
+ 
+     def start_api(self):
+diff --git a/tests/rpc/test_rpc_apiserver.py b/tests/rpc/test_rpc_apiserver.py
+index fc7e3deb5..4657c073a 100644
+--- a/tests/rpc/test_rpc_apiserver.py
++++ b/tests/rpc/test_rpc_apiserver.py
+@@ -1615,6 +1615,51 @@ def test_api_mix_tag(botclient, fee):
+     assert resp["profit_pct"] == 0.5
+ 
+ 
++def test_api_gzip_response(botclient, mocker, fee, markets):
++    ftbot, client = botclient
++    mocker.patch.multiple(EXMS, markets=PropertyMock(return_value=markets))
++    create_mock_trades(fee, is_short=False)
++    Trade.session.flush()
++
++    rc = client_get(client, f"{BASE_URI}/trades?limit=500")
++    assert_response(rc)
++    # The response is larger than the gzip minimum size, so it should be compressed
++    assert len(rc.content) > 1024
++    assert rc.headers.get("content-encoding") == "gzip"
++
++
++def test_api_gzip_disabled(default_conf, mocker, fee, markets):
++    default_conf["runmode"] = RunMode.DRY_RUN
++    default_conf["api_server"] = {
++        "enabled": True,
++        "listen_ip_address": "127.0.0.1",
++        "listen_port": 8080,
++        "CORS_origins": ["http://example.com"],
++        "jwt_secret_key": _JWT_SECRET_KEY,
++        "username": _TEST_USER,
++        "password": _TEST_PASS,
++        "ws_token": _TEST_WS_TOKEN,
++        "enable_gzip": False,
++    }
++    ftbot = get_patched_freqtradebot(mocker, default_conf)
++    mocker.patch.multiple(EXMS, markets=PropertyMock(return_value=markets))
++    mocker.patch("freqtrade.rpc.api_server.webserver.ApiServer.start_api", MagicMock())
++    apiserver = ApiServer(default_conf)
++    apiserver.add_rpc_handler(RPC(ftbot))
++    try:
++        with TestClient(apiserver.app) as client:
++            create_mock_trades(fee, is_short=False)
++            Trade.session.flush()
++
++            rc = client_get(client, f"{BASE_URI}/trades?limit=500")
++            assert_response(rc)
++            assert len(rc.content) > 1024
++            assert rc.headers.get("content-encoding") is None
++    finally:
++        apiserver.cleanup()
++        ApiServer.shutdown()
++
++
+ @pytest.mark.parametrize(
+     "is_short,current_rate,open_trade_value",
+     [(True, 1.098e-05, 6.134625), (False, 1.099e-05, 6.165375)],
+-- 
+2.43.0
+
